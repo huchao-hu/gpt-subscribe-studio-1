@@ -481,7 +481,7 @@ async def _solve_challenge(order_id: str, secrets, view):
             agent = str(client.stripe_http.headers.get("User-Agent") or "")
         except Exception:
             agent = ""
-        token = await asyncio.to_thread(solve_hcaptcha, httpx.Client(timeout=40), challenge,
+        token = await asyncio.to_thread(solve_hcaptcha, httpx.Client(timeout=40, trust_env=False), challenge,
                                         api_key=settings.captcha_api_key, api_url=settings.captcha_api_url,
                                         proxy=secrets.proxy or "", user_agent=agent)
         verified = await asyncio.to_thread(verify_challenge, client.stripe_http, intent_id=intent_id,

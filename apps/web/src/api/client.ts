@@ -291,6 +291,8 @@ export interface ProxyInfo {
   region: string;
   sid: string;
   enabled: boolean;
+  use_clash: boolean;
+  clash_proxy_url: string;
   has_username: boolean;
   has_password: boolean;
   has_region_param?: boolean;
@@ -313,17 +315,24 @@ export async function parseProxy(raw: string): Promise<ProxyInfo> {
   return await res.json();
 }
 
-export async function saveProxy(raw: string, enabled: boolean): Promise<ProxyInfo> {
+export async function saveProxy(options: {
+  raw?: string;
+  enabled: boolean;
+  use_clash: boolean;
+  clash_proxy_url: string;
+}): Promise<ProxyInfo> {
   const res = await fetch("/api/settings/proxies", {
     method: "PUT",
     headers: jsonHeaders,
-    body: JSON.stringify({ raw, enabled }),
+    body: JSON.stringify(options),
   });
   if (!res.ok) throw new Error(await readError(res));
   return await res.json();
 }
 
-export async function testProxy(): Promise<{ ip: string; elapsed_ms: number; region: string; sid: string }> {
+export async function testProxy(): Promise<{
+  ip: string; elapsed_ms: number; region: string; sid: string; mode: "direct" | "proxy" | "clash";
+}> {
   const res = await fetch("/api/settings/proxies/checkout/test", { method: "POST" });
   if (!res.ok) throw new Error(await readError(res));
   return await res.json();

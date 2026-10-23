@@ -191,12 +191,18 @@ class StripeProtocol:
         """返回一个会话；优先 curl_cffi（可模拟 Chrome 的 TLS/JA3 指纹）。"""
         if self._client is None:
             if _HAS_CURL_CFFI and curl_requests is not None:
+                from curl_cffi import CurlOpt
+                curl_options = {CurlOpt.NOPROXY: ""}
+                if not self.proxy:
+                    curl_options[CurlOpt.PROXY] = ""
                 proxies = None
                 if self.proxy:
                     proxies = {"http": self.proxy, "https": self.proxy}
                 self._client = curl_requests.Session(
                     impersonate="chrome124",
                     proxies=proxies,
+                    trust_env=False,
+                    curl_options=curl_options,
                     timeout=self.timeout,
                     headers={"Accept": "application/json"},
                 )
@@ -204,6 +210,7 @@ class StripeProtocol:
             else:
                 self._client = httpx.Client(
                     proxy=self.proxy, timeout=self.timeout,
+                    trust_env=False,
                     headers={"User-Agent": UA, "Accept": "application/json"},
                 )
                 log("   使用 httpx（默认 TLS 指纹）")
@@ -439,7 +446,7 @@ class StripeProtocol:
             return locale, tz
 
         try:
-            with httpx.Client(proxy=proxy, timeout=15) as c:
+            with httpx.Client(proxy=proxy, timeout=15, trust_env=False) as c:
                 r = c.get(
                     "http://ip-api.com/json/",
                     params={"fields": "status,countryCode,timezone,regionName"},

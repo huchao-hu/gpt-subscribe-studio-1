@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
 from gss_core.proxies import GatewayStore
+from gss_core.proxy_relay import relay_manager
 
 from .routers import events, orders, promo, proxies
 
@@ -32,10 +35,18 @@ def create_app() -> FastAPI:
     install_logging_filter(logging.getLogger("gss"))
     settings = load_settings()
 
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(relay_manager.close)
+
     app = FastAPI(
         title="gpt-subscribe-studio API",
         version=__version__,
         description="独立的 ChatGPT 订阅开通工具：粘贴 session，浏览器填卡。",
+        lifespan=lifespan,
     )
     app.include_router(orders.router)
     app.include_router(promo.router)

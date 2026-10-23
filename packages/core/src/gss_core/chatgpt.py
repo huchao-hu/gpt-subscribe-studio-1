@@ -360,6 +360,11 @@ def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IM
         session.trust_env = False
     proxy = str(proxy or "").strip()
     session.proxies = {"http": proxy, "https": proxy} if proxy else {}
+    # libcurl can still consult proxy environment variables despite trust_env.
+    from curl_cffi import CurlOpt
+    session.curl_options[CurlOpt.NOPROXY] = ""
+    if not proxy:
+        session.curl_options[CurlOpt.PROXY] = ""
     return session
 
 

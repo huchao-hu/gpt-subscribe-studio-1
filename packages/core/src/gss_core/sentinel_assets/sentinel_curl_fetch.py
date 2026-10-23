@@ -12,19 +12,25 @@ import json
 import os
 import sys
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 
 
 def handle(payload: dict) -> dict:
     """与历史实现逐字段一致的请求逻辑。"""
+    proxy = str(payload.get("proxy") or "") or None
+    curl_options = {CurlOpt.NOPROXY: ""}
+    if not proxy:
+        curl_options[CurlOpt.PROXY] = ""
     response = requests.request(
         method=str(payload.get("method") or "GET"),
         url=str(payload.get("url") or ""),
         headers={str(k): str(v) for k, v in (payload.get("headers") or {}).items()},
         data=payload.get("body") if payload.get("body") is not None else None,
-        proxy=str(payload.get("proxy") or "") or None,
+        proxy=proxy,
         timeout=float(payload.get("timeout") or 120),
         impersonate="chrome136",
+        trust_env=False,
+        curl_options=curl_options,
     )
     return {
         "status": int(response.status_code),

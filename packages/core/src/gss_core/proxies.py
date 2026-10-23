@@ -9,12 +9,32 @@ import re
 import secrets
 import string
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import RLock
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 ROLES = ("checkout", "approve")
+DEFAULT_CLASH_URL = "http://127.0.0.1:7897"
+
+
+def validate_clash_url(value: str) -> str:
+    message = "Clash 地址必须是本机 HTTP 入口，例如 http://127.0.0.1:7897"
+    try:
+        if not isinstance(value, str) or len(value) > 2048 or any(c.isspace() for c in value):
+            raise ValueError()
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        local = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        if (parsed.scheme != "http" or not local or not parsed.port
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+            raise ValueError()
+        host = "127.0.0.1" if host == "localhost" else host
+        host = f"[{host}]" if ":" in host else host
+        return f"http://{host}:{parsed.port}"
+    except (ValueError, TypeError):
+        raise ValueError(message) from None
 # 供应商写法不一：-region-US / _country_us、-sid-abc / -session-abc。替换时保留原来的键名与大小写。
 _REGION = re.compile(r"([-_](?:region|country|area|cc)[-_])([A-Za-z]{2})(?=[-_]|$)", re.I)
 _SID = re.compile(r"([-_](?:sid|session|sessid|sessionid)[-_])([A-Za-z0-9]+)(?=[-_]|$)", re.I)
@@ -48,6 +68,8 @@ class Gateway:
     region: str = ""
     sid: str = ""
     enabled: bool = False
+    use_clash: bool = False
+    clash_proxy_url: str = DEFAULT_CLASH_URL
 
     def validate(self):
         if self.scheme not in {"http", "https", "socks5"}:
@@ -56,6 +78,9 @@ class Gateway:
             raise ValueError("端口必须是 1 到 65535 的整数")
         if type(self.enabled) is not bool:
             raise ValueError("启用状态格式不正确")
+        if type(self.use_clash) is not bool:
+            raise ValueError("Clash 开关格式不正确")
+        self.clash_proxy_url = validate_clash_url(self.clash_proxy_url)
         for value in (self.host, self.username, self.password, self.region, self.sid):
             if not isinstance(value, str) or len(value) > 1024:
                 raise ValueError("代理字段格式不正确或过长")
@@ -100,7 +125,21 @@ class Gateway:
             "enabled": self.enabled,
             "has_username": bool(self.username),
             "has_password": bool(self.password),
+            "use_clash": self.use_clash,
+            "clash_proxy_url": self.clash_proxy_url,
         }
+
+    def effective_proxy_url(self) -> str | None:
+        if not self.enabled or not self.use_clash:
+            return self.proxy_url()
+        from .proxy_relay import relay_manager
+
+        scheme, port = relay_manager.endpoint(self.host, self.port, self.scheme, self.clash_proxy_url)
+        return replace(self, host="127.0.0.1", port=port, scheme=scheme).proxy_url()
+
+    @property
+    def mode(self) -> str:
+        return "direct" if not self.enabled else ("clash" if self.use_clash else "proxy")
 
 
 def proxy_config_path() -> Path:
@@ -145,6 +184,8 @@ class GatewayStore:
             "sid",
             "enabled",
             "clear_auth",
+            "use_clash",
+            "clash_proxy_url",
         }:
             raise ValueError("代理配置字段不正确")
         with self.lock:
@@ -169,26 +210,41 @@ class GatewayStore:
                 merged["region"] = merged["sid"] = ""
             gateway = Gateway(**merged).validate()
             data[role] = asdict(gateway)
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            handle, temporary = tempfile.mkstemp(prefix=".proxy-", dir=self.path.parent)
-            try:
-                with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                    json.dump(data, stream, ensure_ascii=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, self.path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            self._write(data)
             return gateway
+
+    def save_all(self, gateway: Gateway) -> Gateway:
+        """Both roles change in one atomic file replacement."""
+        gateway.validate()
+        with self.lock:
+            data = self._read()
+            for role in ROLES:
+                data[role] = asdict(gateway)
+            self._write(data)
+        return gateway
+
+    def _write(self, data):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle, temporary = tempfile.mkstemp(prefix=".proxy-", dir=self.path.parent)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def configured_proxy(role: str) -> str | None:
     """每次读取持久化的该阶段配置，不覆盖另一阶段。"""
     try:
-        return GatewayStore().get(role).proxy_url()
+        return GatewayStore().get(role).effective_proxy_url()
     except (OSError, ValueError, TypeError):
-        return None
+        # Invalid enabled configuration must never turn into a direct request.
+        from gss_contracts import DomainError, ErrorCode
+        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "代理配置或本机转发初始化失败，请检查代理设置") from None
 
 
 def new_proxy_sid() -> str:
