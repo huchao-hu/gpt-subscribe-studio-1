@@ -21,6 +21,7 @@
 - [已知行为](#已知行为)
 - [hCaptcha 探索记录](#hcaptcha-探索记录)
 - [未解决的问题](#未解决的问题)
+- [免责声明与风险提示](#免责声明与风险提示)
 - [仓库安全](#仓库安全)
 - [归档](#归档)
 
@@ -44,7 +45,8 @@ Plus / Go / Pro 家族走的是 custom checkout，链路不同，见「支持的
 
 ### 不做什么
 
-- **不启动浏览器**。链路里没有任何 Chrome / Playwright / Puppeteer。
+- **服务端不启动浏览器**。链路里没有任何 Chrome / Playwright / Puppeteer；
+  Stripe 输入框模式用的是你自己浏览器里的 Stripe.js。
 - **不调用打码服务**。命中 hCaptcha `intent_confirmation_challenge` 时直接判定放弃本单。
 - **不落库卡号**。卡号只在单次请求的内存里使用，不写日志、不入库。
 
@@ -56,11 +58,11 @@ Plus / Go / Pro 家族走的是 custom checkout，链路不同，见「支持的
 
 | 档位 | 代码 | 挂牌价 | 结账类型 | 会话 id | 支付入口 |
 |---|---|---|---|---|---|
-| Plus | `plus` | $20 / 月 | custom | `oaics_` | `/pay` 编排管线 |
-| Go | `go` | $8 / 月 | custom | `oaics_` | `/pay` |
-| Pro Lite | `pro_lite` | $100 / 月 | custom | `oaics_` | `/pay` |
-| Pro | `pro` | $200 / 月 | custom | `oaics_` | `/pay` |
-| Pro Max | `pro_max` | $500 / 月 | custom | `oaics_` | `/pay` |
+| Plus | `plus` | $20 / 月 | custom | `oaics_` / `cs_live_` | **`/pay-protocol` 纯协议** |
+| Go | `go` | $8 / 月 | custom | `oaics_` / `cs_live_` | **`/pay-protocol` 纯协议** |
+| Pro Lite | `pro_lite` | $100 / 月 | custom | `oaics_` / `cs_live_` | **`/pay-protocol` 纯协议** |
+| Pro | `pro` | $200 / 月 | custom | `oaics_` / `cs_live_` | **`/pay-protocol` 纯协议** |
+| Pro Max | `pro_max` | $500 / 月 | custom | `oaics_` / `cs_live_` | **`/pay-protocol` 纯协议** |
 | Team | `team` | $25 / 席 / 月 | hosted | `cs_live_` | **`/pay-protocol` 纯协议** |
 
 ### Plus 家族（custom checkout）
@@ -96,19 +98,67 @@ US PH CL EG JP GB TR BR MX IN ID VN TH MY SG KR AU CA DE NL PL AR SA AE ZA
 
 每个地区绑定币种，建单时决定结账币种。完整表在 `packages/core/src/gss_core/countries.py`。
 
-### 当前实现状态
+### 实现状态
 
-纯协议链路（`/pay-protocol`）只覆盖 **Team**。它从结账地址里取 `cs_live_`，
-而 Plus 家族的地址里是 `oaics_`，取不到 —— 对 Plus 订单调用会返回：
+两族都走 `/pay-protocol`，服务端按订单的 `checkout_kind` 自动分流：
 
 ```
-502 checkout_upstream_error
-URL 里没有 cs_live_: https://chatgpt.com/checkout/oaics_…
+checkout_kind = hosted  → StripeProtocol   （Team，payment_pages/{cs}/confirm）
+checkout_kind = custom  → PlusProtocol     （Plus 家族，ChatGPT confirm + PaymentIntent）
 ```
 
-Plus 家族目前只有 `/pay` 编排管线这一条路，它依赖浏览器产出的 `ctoken_`。
-浏览器路线归档后，Web 界面上 Plus 家族没有可用的支付入口 —— 这一条列在
-「未解决的问题」里。
+Plus 家族的会话 id 有两种形态，两种都支持：
+
+- `oaics_…` —— ChatGPT 内部结账会话
+- `cs_live_…` —— Stripe Custom Checkout 会话（此时额外走一次 finalize 取 PaymentIntent）
+
+### Plus 的协议链路
+
+```
+① mint_sentinel                    挂 openai-sentinel-token / -so-token
+② POST /v1/payment_methods         卡号 → pm_（带 allow_redisplay=always）
+③ POST /v1/confirmation_tokens     pm_  → ctoken_
+④ POST /backend-api/payments/checkout/confirm
+④b finalize_stripe_custom_checkout 仅 cs_ 会话，取 PaymentIntent
+⑤ POST /v1/payment_intents/{id}/confirm
+⑥ 判定：拒卡 / 成功 / 需 3DS / 命中 hCaptcha
+```
+
+### 两种提交方式（界面可切换，默认协议）
+
+Plus / Pro 家族的界面上有「协议提交」与「Stripe 输入框」两个选项：
+
+| 方式 | 卡号经过 | 取 pm_ 的方式 | 适用 |
+|---|---|---|---|
+| **协议提交**（默认） | 本服务 → Stripe API | 服务端 `POST /v1/payment_methods` | 批量、无人值守 |
+| **Stripe 输入框** | 只在浏览器 → Stripe iframe | 浏览器 Stripe.js 产出 `pm_` | 指纹与 Radar 信号最接近真人 |
+
+两种方式在 `pm_` 之后的服务端链路完全相同：
+
+```
+pm_ → ctoken_ → ChatGPT confirm → PaymentIntent → Stripe confirm
+```
+
+API 层通过二选一的字段区分：
+
+```json
+{ "card": {...}, "billing": {...} }              // 协议提交
+{ "payment_method_id": "pm_…", "billing": {...} } // Stripe 输入框
+```
+
+两者都要求 `billing`，且都会走同一套税费同步与保存选择配对逻辑。
+
+**注意**：用 publishable key 造 `pm_` 时必须带 `client_attribution_metadata`，
+否则 Stripe 返回 `This integration surface is unsupported for publishable key tokenization`。
+
+两个容易踩的点：
+
+- **保存选择必须配对**：ctoken 的 `setup_future_usage` 与 confirm 的
+  `save_payment_method_for_reuse` 不一致时，上游返回
+  `Card save choice does not match confirmation token`。
+  代码按 `(None, None)` → `(off_session, true)` → `(on_session, true)` 依次尝试。
+- **pm 要声明 `allow_redisplay=always`**：订阅需要保存卡片复用，不声明时
+  即使保存选择配对也会被拒。
 
 
 ---
@@ -172,12 +222,40 @@ Plus 家族目前只有 `/pay` 编排管线这一条路，它依赖浏览器产�
 按请求计的挑战率是另一个口径：这 12 张卡在反复重试中累计 36 次 confirm，
 其中约 94% 命中挑战。两个数字都对，分母不同。
 
+### Plus 家族批量实测（18 张卡池）
+
+全部走 `plan=plus`、账单地址 US、标准模式：
+
+| 结果 | 张数 | 说明 |
+|---|---|---|
+| **拒卡** | **18 / 18** | 全部拿到 `card_declined` |
+| ├ `fraudulent` | 13 | 发卡行判定风险交易 |
+| ├ `generic_decline` | 1 | 发卡行未说明原因 |
+| └ ChatGPT 侧拒绝 | 4 | 未到发卡行，无 Stripe 拒卡码 |
+
+**拒卡率 100%。** 单次约 14 秒。
+
+拒卡码的分布有信息量：13 张落在 `fraudulent`，说明这套卡在 Plus（$20/月）
+这个价位上基本都被发卡行直接判风险，与是否过挑战无关 —— 纯协议链路
+不需要通过 hCaptcha 就能拿到这个结论。
+
+### 代理出口的两个坑
+
+- **地区必须显式对齐**：网关配置里的用户名是 `-region-JP-`，
+  不调 `align_proxy_region(..., "US")` 会抽到日本出口，
+  Stripe 直接回 `billing country must match`。
+- **SID 固定 = 坏出口会一直坏**：代理抽到坏 IP 时表现为
+  `SSL: UNEXPECTED_EOF_WHILE_READING` 或 `TLS connect error`。
+  `PlusProtocol.pay_from_url()` 遇到这类错误会轮换 SID 重试，最多 3 次。
+  实测该代理约 17% 的连接会失败。
+
 ### 耗时
 
 | 项目 | 数值 |
 |---|---|
-| 默认精简链路 | **7 秒** |
-| 全环节打开 | 35 秒 |
+| Team 默认精简链路 | **7 秒** |
+| Team 全环节打开 | 35 秒 |
+| Plus 家族（custom 链） | 约 14 秒 |
 
 ### 两个 hCaptcha sitekey
 
@@ -497,15 +575,48 @@ confirm 请求里带一个 `rv_timestamp`：**212 字符**，字符集 43 个符
 缺：前端在提交前后拿到的是两个不同来源的金额（报价 vs init），
 金额变化时是否要中断并要求刷新报价，还没定。
 
-**7. Plus 家族在 Web 界面上没有支付入口**
+**7. Plus 家族的 hCaptcha 与 3DS 分支覆盖不足**
 
-已知：Plus / Go / Pro 家族的结账是 custom 类型（`oaics_`），
-支付要 `ctoken_`（Stripe Elements 在浏览器产出）走 `/pay` 编排管线；
-而纯协议端点只认 `cs_live_`，对 Plus 订单直接返回 502。
-缺：一个不依赖浏览器的 Plus 支付路径 —— 后端已有
-`create_confirmation_token(publishable_key, payment_method=pm_)`
-可以把服务端造的 `pm_` 换成 `ctoken_`，但没有接到文案与界面里，
-也没有端到端跑通过。
+已知：custom 流同样会弹 `intent_confirmation_challenge`（实测 4 张卡里 1 张），
+且 `requires_action` 时纯协议无法完成。
+缺：挑战命中率样本量太小（4 张），还不足以判断 Plus 与 Team 的挑战率是否相同。
+
+---
+
+## 免责声明与风险提示
+
+**使用本项目前请完整阅读以下内容。使用、部署、修改或分发本项目，即表示你已理解并接受这些风险。**
+
+1. **仅供学习与技术研究**
+   本项目是对公开网页行为的协议层研究与工程实践，不构成任何商业服务承诺，也不保证可用于生产环境。
+
+2. **与第三方无关联**
+   本项目与 OpenAI、ChatGPT、Stripe 及任何支付、代理服务商均无隶属、授权或合作关系。相关名称、商标归其各自所有者。
+
+3. **依赖非公开接口，可能违反服务条款**
+   本项目通过模拟浏览器请求的方式调用 ChatGPT 与 Stripe 的**非公开、未文档化**接口，并使用代理出口与浏览器指纹模拟。这类用法可能违反 OpenAI、Stripe 及相关服务的服务条款或使用政策。上游随时可能修改接口、风控策略或版本，导致功能部分或全部失效，且不会另行通知。
+
+4. **账号风险：可能被限制、风控或封禁**
+   使用本项目可能导致用于开通的 ChatGPT 账号、关联的支付方式、代理 IP 乃至相关账户被**风控、限制功能、暂停或永久封禁**，已开通的订阅也可能被取消或回收。这类损失无法恢复，本项目及其作者不提供任何补偿或申诉协助。
+
+5. **资金风险**
+   - 扣款成功即视为订单成功，订阅是否真正生效**不作为**交付前提。可能出现「已扣款但订阅未生效」「重复扣款」「被拒付或退款」「金额与预期不符（含税费、汇率、活动价变动）」等情况，请在使用后自行到账号与账单中核对。
+   - 促销、优惠活动（`promo`）由上游控制，资格、价格与有效期可能随时变化，滥用促销可能触发风控或被追缴。
+   - 3DS 验证、银行风控、卡片限额等均可能导致支付失败或状态不确定。
+   - 本项目会真实发起扣款请求。测试请使用自有卡或发卡方提供的测试卡，不要使用他人卡片。
+
+6. **合法授权与使用者责任**
+   你必须确保对所使用的账号、Session、银行卡、代理拥有合法授权，并遵守所在地法律法规、上游服务条款与支付网络规则。**严禁**将本项目用于盗刷、使用他人未授权的卡片或账号、欺诈、批量滥用或任何违法用途。「代他人开通并收费」属于你与客户之间的商业关系，是否合法及是否需要资质由你自行判断并承担责任。
+
+7. **数据与安全责任**
+   - 本项目不落盘 Session，交付后即销毁。
+   - 两种提交方式对卡号的处理不同：**协议提交**模式下卡号会经过本服务内存（不写日志、不入库，仅在单次请求内使用）；**Stripe 输入框**模式下卡号只进入 Stripe 的 iframe，本服务拿不到。
+   - 部署环境、代理、日志、反向代理与服务器的安全由使用者自行负责。请勿将真实凭证、卡号、抓包文件（HAR）、代理账密提交到任何仓库或发给他人。
+
+8. **无担保与责任限制**
+   本项目按「现状」提供，不附带任何明示或暗示的担保，包括但不限于适销性、特定用途适用性、稳定性与不侵权。在适用法律允许的最大范围内，作者及贡献者不对因使用或无法使用本项目造成的任何直接或间接损失（包括但不限于账号封禁、资金损失、数据丢失、业务中断、第三方索赔）承担责任。
+
+如果你不接受以上任何一条，请不要使用本项目。
 
 ---
 
@@ -533,4 +644,4 @@ confirm 请求里带一个 `rv_timestamp`：**212 字符**，字符集 43 个符
 
 ---
 
-欢迎加入群聊：https://t.me/TokenFlying
+欢迎加入群聊：https://t.me/+op8u6XEdswg0YTVh

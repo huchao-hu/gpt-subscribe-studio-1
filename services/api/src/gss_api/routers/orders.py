@@ -6,6 +6,7 @@ import asyncio
 import httpx
 import json
 import logging
+import re
 import time
 from decimal import Decimal
 from typing import Optional
@@ -28,6 +29,7 @@ from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.config import load_settings, use_fake_adapters
 from gss_core.countries import is_supported, normalize_country
 from gss_core.hosted import TeamHostedClient
+from gss_core.plus_protocol import PlusProtocol
 from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
 from gss_core.proxies import align_proxy_region, configured_proxy, session_proxy
 from gss_core.redaction import redact_sensitive
@@ -792,6 +794,7 @@ class ProtocolPayRequest(BaseModel):
     payment_method_id: Optional[str] = Field(default=None, max_length=80)
     billing: BillingIn
     proxy: Optional[str] = Field(default=None, max_length=300)
+    publishable_key: Optional[str] = Field(default=None, max_length=120)
     steps: ProtocolStepsIn = ProtocolStepsIn()
 
 
@@ -847,16 +850,47 @@ async def pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Prot
     settings = load_settings()
     captcha_key = getattr(settings, "captcha_api_key", "") or ""
     captcha_url = getattr(settings, "captcha_api_url", "https://api.yescaptcha.com")
-    proxy = payload.proxy or align_proxy_region(
-        configured_proxy("checkout"), payload.billing.country
+    # 出口按「用户选择的账单地区」自动对齐，并且每次支付用新的 SID：
+    # 复用配置里固定的 SID 会一直撞同一个出口 IP，抽到坏 IP 时整单必挂。
+    proxy = (
+        payload.proxy
+        or session_proxy("checkout", payload.billing.country)
+        or align_proxy_region(configured_proxy("checkout"), payload.billing.country)
     )
+
+    secrets = vault.get(order_id)
+    session_raw = (secrets.session if secrets else "") or ""
+    publishable_key = (
+        (payload.publishable_key or "")
+        or (getattr(view, "publishable_key", "") or "")
+        or ((secrets.publishable_key if secrets else "") or "")
+    )
+    currency = (getattr(view, "currency", "") or "") or "USD"
 
     pm_id = resolve_protocol_payment_method(payload)
     card = payload.card.model_dump() if payload.card else {}
     billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
     billing["country"] = (billing.get("country") or "US").upper()
 
+    # custom checkout 的会话 id 有两种：oaics_（ChatGPT 内部）与 cs_live_（Stripe 自定义）。
+    # 单看 URL 前缀会漏掉后者，所以以订单的 checkout_kind 为准。
+    is_custom_checkout = (
+        str(getattr(view, "checkout_kind", "") or "").lower() == "custom"
+        or bool(re.search(r"oaics_[A-Za-z0-9]+", checkout_url))
+    )
+
     def _run() -> PaymentOutcome:
+        if is_custom_checkout:
+            # Plus / Go / Pro 家族：custom checkout（oaics_），走 ChatGPT 确认链
+            pp = PlusProtocol(
+                session=session_raw, checkout_url=checkout_url,
+                publishable_key=publishable_key, card=card, billing=billing,
+                proxy=proxy, currency=currency,
+            )
+            # 浏览器 Stripe 输入框已换好 pm_ 时复用它，服务端不再提交卡号
+            pp.external_pm = pm_id
+            # pay_from_url 内含代理轮换重试，结束时自己关闭客户端
+            return pp.pay_from_url()
         sp = StripeProtocol(
             proxy=proxy, captcha_key=captcha_key, captcha_url=captcha_url,
             card=card, billing=billing,
